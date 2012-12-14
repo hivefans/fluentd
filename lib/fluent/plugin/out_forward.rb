@@ -25,7 +25,6 @@ class ForwardOutput < ObjectBufferedOutput
     super
     require 'socket'
     require 'fileutils'
-    require 'fluent/plugin/socket_util'
     @nodes = []  #=> [Node]
   end
 
@@ -34,12 +33,16 @@ class ForwardOutput < ObjectBufferedOutput
   config_param :recover_wait, :time, :default => 10
   config_param :hard_timeout, :time, :default => 60
   config_param :expire_dns_cache, :time, :default => nil  # 0 means disable cache
-  config_param :phi_threshold, :integer, :default => 16
+  config_param :phi_threshold, :integer, :default => 8
   attr_reader :nodes
 
   # backward compatibility
   config_param :port, :integer, :default => DEFAULT_LISTEN_PORT
   config_param :host, :string, :default => nil
+  # encrypt
+  config_param :password, :string, :default => nil
+  # compress
+  config_param :compression_level, :integer, :default => 0
 
   def configure(conf)
     super
@@ -55,6 +58,10 @@ class ForwardOutput < ObjectBufferedOutput
     end
 
     recover_sample_size = @recover_wait / @heartbeat_interval
+
+    @compression_level = [9, @compression_level].min
+    @compression_level = nil if @compression_level <= 0
+    $log.info "compression level is #{@compression_level}" if @compression_level
 
     conf.elements.each {|e|
       next if e.name != "server"
@@ -89,8 +96,7 @@ class ForwardOutput < ObjectBufferedOutput
 
     @loop = Coolio::Loop.new
 
-    # Assume all hosts are same protocol.
-    @usock = SocketUtil.create_udp_socket(@nodes.first.host)
+    @usock = UDPSocket.new
     @hb = HeartbeatHandler.new(@usock, method(:on_heartbeat))
     @loop.attach(@hb)
 
@@ -128,8 +134,8 @@ class ForwardOutput < ObjectBufferedOutput
 
     wlen = @weight_array.length
     wlen.times do
-      @rr = (@rr + 1) % wlen
       node = @weight_array[@rr]
+      @rr = (@rr + 1) % wlen
 
       if node.available?
         begin
@@ -149,8 +155,23 @@ class ForwardOutput < ObjectBufferedOutput
     end
   end
 
-  private
+  protected
+  def encrypt(data, password, salt = '')
+    cipher = OpenSSL::Cipher::BF.new
+    key_iv = OpenSSL::PKCS5.pbkdf2_hmac_sha1(password, salt, 2000, cipher.key_len + cipher.iv_len)
+    key = key_iv[0, cipher.key_len]
+    iv = key_iv[cipher.key_len, cipher.iv_len]
+    cipher.key = key
+    cipher.iv = iv
+    cipher.encrypt
+    
+    encrypted_data = ''
+    encrypted_data << cipher.update(data)
+    encrypted_data << cipher.final
+    encrypted_data 
+  end
 
+  private
   def rebuild_weight_array
     standby_nodes, regular_nodes = @nodes.partition {|n|
       n.standby?
@@ -193,8 +214,8 @@ class ForwardOutput < ObjectBufferedOutput
     @weight_array = weight_array
   end
 
-  # MessagePack FixArray length = 2
-  FORWARD_HEADER = [0x92].pack('C')
+  # MessagePack FixArray length = 3
+  FORWARD_HEADER = [0x93].pack('C')
 
   def send_data(node, tag, es)
     sock = connect(node)
@@ -205,6 +226,39 @@ class ForwardOutput < ObjectBufferedOutput
       opt = [@send_timeout.to_i, 0].pack('L!L!')  # struct timeval
       sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_SNDTIMEO, opt)
 
+      # attribute
+      attribute = {}
+      attribute_detail = {}
+      attribute_detail['compressed'] = !@compression_level.nil?
+      attribute['encrypted'] = !@password.nil?
+      attribute['detail'] = attribute_detail
+
+      entries = es.read
+
+      if attribute_detail['compressed']
+        # entries
+        before_size = entries.bytesize
+        entries = Zlib::Deflate.deflate(entries, @compression_level)
+        after_size = entries.bytesize
+        percent = sprintf("%.2f", after_size.to_f / before_size.to_f * 100)
+        $log.trace("entries deflated: #{before_size} bytes to #{after_size} bytes (#{percent} %)")
+      end
+      if attribute['encrypted']
+        # salt
+        attribute['salt'] = OpenSSL::Random.random_bytes(8)
+        # tag
+        decrypted_tag = tag.dump
+        tag = encrypt(tag, @password, attribute['salt'])
+        encrypted_tag = tag.dump
+        $log.trace("tag encrypted(dump): [#{decrypted_tag}] -> [#{encrypted_tag}]")
+        # entries
+        entries = encrypt(entries, @password, attribute['salt'])
+        # attribute detail
+        attribute_detail = encrypt(attribute_detail.to_msgpack, @password, attribute['salt'])
+      end
+      $log.trace("msg attribute:#{attribute}")
+      attribute['detail'] = attribute_detail
+
       # beginArray(2)
       sock.write FORWARD_HEADER
 
@@ -212,7 +266,7 @@ class ForwardOutput < ObjectBufferedOutput
       sock.write tag.to_msgpack  # tag
 
       # beginRaw(size)
-      sz = es.size
+      sz = entries.bytesize
       #if sz < 32
       #  # FixRaw
       #  sock.write [0xa0 | sz].pack('C')
@@ -225,9 +279,10 @@ class ForwardOutput < ObjectBufferedOutput
       #end
 
       # writeRawBody(packed_es)
-      es.write_to(sock)
+      sock.write entries
 
-      node.heartbeat(false)
+      # write attribute
+      sock.write attribute.to_msgpack
     ensure
       sock.close
     end
@@ -259,7 +314,7 @@ class ForwardOutput < ObjectBufferedOutput
       end
       begin
         #$log.trace "sending heartbeat #{n.host}:#{n.port}"
-        @usock.send "\0", 0, Socket.pack_sockaddr_in(n.port, n.resolved_host)
+        @usock.send "", 0, Socket.pack_sockaddr_in(n.port, n.resolved_host)
       rescue
         # TODO log
         $log.debug "failed to send heartbeat packet to #{n.host}:#{n.port}", :error=>$!.to_s
@@ -384,13 +439,13 @@ class ForwardOutput < ObjectBufferedOutput
       end
     end
 
-    def heartbeat(detect=true)
+    def heartbeat
       now = Time.now.to_f
       @failure.add(now)
       #$log.trace "heartbeat from '#{@name}'", :host=>@host, :port=>@port, :available=>@available, :sample_size=>@failure.sample_size
-      if detect && !@available && @failure.sample_size > @recover_sample_size
-        @available = true
+      if !@available && @failure.sample_size > @recover_sample_size
         $log.info "recovered forwarding server '#{@name}'", :host=>@host, :port=>@port
+        @available = true
         return true
       else
         return nil
@@ -496,4 +551,3 @@ end
 
 
 end
-
