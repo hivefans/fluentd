@@ -16,7 +16,7 @@
 #    limitations under the License.
 #
 module Fluent
-
+require "zlib"
 
 class ForwardOutput < ObjectBufferedOutput
   Plugin.register_output('forward', self)
